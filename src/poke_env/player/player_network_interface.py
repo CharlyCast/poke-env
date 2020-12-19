@@ -22,6 +22,7 @@ from aiologger import Logger  # pyre-ignore
 from poke_env.exceptions import ShowdownException
 from poke_env.player_configuration import PlayerConfiguration
 from poke_env.server_configuration import ServerConfiguration
+from poke_env.player.ipc import connect, AbstractChannel
 
 
 class PlayerNetwork(ABC):
@@ -60,11 +61,12 @@ class PlayerNetwork(ABC):
         self._password = player_configuration.password
         self._username = player_configuration.username
         self._server_url = server_configuration.server_url
+        self._is_unix = server_configuration.is_unix
 
         self._logged_in: Event = Event()
         self._sending_lock = Lock()
 
-        self._websocket: websockets.client.WebSocketClientProtocol  # pyre-ignore
+        self._channel: AbstractChannel  # pyre-ignore
         self._logger: Logger = self._create_player_logger(log_level)  # pyre-ignore
 
         if start_listening:
@@ -217,7 +219,7 @@ class PlayerNetwork(ABC):
             to_send = "|".join([room, message, message_2])
         else:
             to_send = "|".join([room, message])
-        await self._websocket.send(to_send)
+        await self._channel.send(to_send)
         self.logger.info("\033[93m\033[1m>>>\033[0m %s", to_send)
 
     async def _set_team(self):
@@ -235,21 +237,18 @@ class PlayerNetwork(ABC):
         assert self.logged_in
 
     async def listen(self) -> None:
-        """Listen to a showdown websocket and dispatch messages to be handled."""
-        self.logger.info("Starting listening to showdown websocket")
+        """Listen to a showdown using an IPC channel and dispatch messages to be handled."""
+        self.logger.info("Starting listening to showdown server")
         coroutines = []
         try:
-            async with websockets.connect(
-                self.websocket_url, max_queue=None
-            ) as websocket:
-                self._websocket = websocket
-                async for message in websocket:
+            async with connect(self.server_url, self._is_unix) as channel:
+                print(f"Channel: {channel}")
+                self._channel = channel
+                async for message in channel:
                     self.logger.info("\033[92m\033[1m<<<\033[0m %s", message)
                     coroutines.append(ensure_future(self._handle_message(message)))
         except websockets.exceptions.ConnectionClosedOK:
-            self.logger.warning(
-                "Websocket connection with %s closed", self.websocket_url
-            )
+            self.logger.warning("Websocket connection with %s closed", self.server_url)
         except (CancelledError, RuntimeError) as e:
             self.logger.critical("Listen interrupted by %s", e)
         except Exception as e:
@@ -261,7 +260,7 @@ class PlayerNetwork(ABC):
     async def stop_listening(self) -> None:
         if self._listening_coroutine is not None:
             self._listening_coroutine.cancel()
-        await self._websocket.close()
+        await self._channel.close()
 
     @abstractmethod
     async def _handle_battle_message(self, split_messages: List[List[str]]) -> None:
@@ -305,7 +304,7 @@ class PlayerNetwork(ABC):
         return self._username
 
     @property
-    def websocket_url(self) -> str:
+    def server_url(self) -> str:
         """The websocket url.
 
         It is derived from the server url.
@@ -313,4 +312,6 @@ class PlayerNetwork(ABC):
         :return: The websocket url.
         :rtype: str
         """
+        if self._is_unix:
+            return self._server_url
         return f"ws://{self._server_url}/showdown/websocket"
